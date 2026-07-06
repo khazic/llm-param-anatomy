@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>一层 Transformer 的参数解剖</title>
+<style>
+  :root {
+    --bg: #f4f5f8;
+    --panel: #ffffff;
+    --ink: #1a1d29;
+    --ink-soft: #565b70;
+    --ink-faint: #8b90a6;
+    --line: #dfe2ec;
+    --line-strong: #c3c8d8;
+    --accent: #4f46e5;
+    --accent-soft: #eef0fe;
+
+    --attn: #0d9488;        /* teal — attention */
+    --attn-soft: #d7f2ee;
+    --ffn: #c2681a;         /* amber — FFN / experts */
+    --ffn-soft: #fbeada;
+    --embed: #9333ea;       /* violet — embedding */
+    --embed-soft: #f2e6fc;
+    --router: #be123c;      /* rose — router / gate */
+    --router-soft: #fce0e6;
+    --shared: #2563eb;      /* blue — shared expert */
+    --shared-soft: #e0eafc;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Menlo", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1117;
+      --panel: #171a24;
+      --ink: #e7e9f2;
+      --ink-soft: #a3a8bd;
+      --ink-faint: #6e7488;
+      --line: #262a38;
+      --line-strong: #363b4d;
+      --accent: #8b83ff;
+      --accent-soft: #22213a;
+      --attn: #2dd4bf; --attn-soft: #123833;
+      --ffn: #e8a24d; --ffn-soft: #3a2a12;
+      --embed: #c084fc; --embed-soft: #2c1a3d;
+      --router: #fb7185; --router-soft: #3a1520;
+      --shared: #60a5fa; --shared-soft: #14243f;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f5f8; --panel: #ffffff; --ink: #1a1d29; --ink-soft: #565b70; --ink-faint: #8b90a6;
+    --line: #dfe2ec; --line-strong: #c3c8d8; --accent: #4f46e5; --accent-soft: #eef0fe;
+    --attn: #0d9488; --attn-soft: #d7f2ee; --ffn: #c2681a; --ffn-soft: #fbeada;
+    --embed: #9333ea; --embed-soft: #f2e6fc; --router: #be123c; --router-soft: #fce0e6;
+    --shared: #2563eb; --shared-soft: #e0eafc;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1117; --panel: #171a24; --ink: #e7e9f2; --ink-soft: #a3a8bd; --ink-faint: #6e7488;
+    --line: #262a38; --line-strong: #363b4d; --accent: #8b83ff; --accent-soft: #22213a;
+    --attn: #2dd4bf; --attn-soft: #123833; --ffn: #e8a24d; --ffn-soft: #3a2a12;
+    --embed: #c084fc; --embed-soft: #2c1a3d; --router: #fb7185; --router-soft: #3a1520;
+    --shared: #60a5fa; --shared-soft: #14243f;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 40px 22px 80px; }
+
+  header { margin-bottom: 34px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--accent); font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(24px, 4vw, 34px); margin: 8px 0 6px; letter-spacing: -.01em;
+    text-wrap: balance; font-weight: 700;
+  }
+  .sub { color: var(--ink-soft); font-size: 15px; max-width: 60ch; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-faint); font-weight: 600; margin: 0 0 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2::after { content:""; flex:1; height:1px; background: var(--line); }
+
+  section { margin-top: 40px; }
+
+  /* master formula */
+  .master {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px 24px; font-family: var(--mono); font-size: clamp(13px, 2.4vw, 16px);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; line-height: 2;
+  }
+  .tok { padding: 4px 10px; border-radius: 8px; font-weight: 600; white-space: nowrap; }
+  .op { color: var(--ink-faint); font-weight: 700; }
+  .t-embed { background: var(--embed-soft); color: var(--embed); }
+  .t-layer { background: var(--accent-soft); color: var(--accent); }
+  .t-attn { background: var(--attn-soft); color: var(--attn); }
+  .t-ffn { background: var(--ffn-soft); color: var(--ffn); }
+  .note-inline { font-family: var(--sans); font-size: 12.5px; color: var(--ink-faint); width: 100%; margin-top: 4px; }
+
+  /* card grid */
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    overflow: hidden;
+  }
+  .card-head {
+    padding: 14px 18px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+  .card-title { font-weight: 700; font-size: 15px; }
+  .card-tag { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); margin-left: auto; }
+
+  /* projection rows */
+  .rows { padding: 8px 0; }
+  .row {
+    display: grid; grid-template-columns: 74px 1fr auto; gap: 14px; align-items: center;
+    padding: 10px 18px;
+  }
+  .row + .row { border-top: 1px dashed var(--line); }
+  .pname { font-family: var(--mono); font-weight: 700; font-size: 14px; }
+  .flow {
+    font-family: var(--mono); font-size: 13px; color: var(--ink-soft);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .pill {
+    font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 6px;
+    border: 1px solid var(--line-strong); background: var(--bg); white-space: nowrap;
+  }
+  .arrow { color: var(--ink-faint); }
+  .pcount {
+    font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right;
+    font-variant-numeric: tabular-nums; color: var(--ink);
+  }
+  .subtotal {
+    padding: 12px 18px; border-top: 1px solid var(--line-strong);
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .subtotal b { font-size: 14px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .expl { font-family: var(--sans); font-size: 12.5px; color: var(--ink-soft); padding: 0 18px 14px; }
+
+  /* MoE stack */
+  .moe-part {
+    display: grid; grid-template-columns: 14px 1fr auto; gap: 12px; align-items: center;
+    padding: 11px 18px; font-size: 13.5px;
+  }
+  .moe-part + .moe-part { border-top: 1px dashed var(--line); }
+  .bar { width: 14px; height: 30px; border-radius: 4px; }
+  .moe-label { font-weight: 600; }
+  .moe-formula { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .moe-count { font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* total vs activated */
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 720px) { .compare { grid-template-columns: 1fr; } }
+  .cbox { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .cbox h3 { margin: 0 0 4px; font-size: 15px; }
+  .cbox .big { font-family: var(--mono); font-size: 26px; font-weight: 700; letter-spacing: -.01em; }
+  .cbox .cap { font-size: 12.5px; color: var(--ink-soft); margin-top: 6px; }
+  .badge { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .b-total { background: var(--ffn-soft); color: var(--ffn); }
+  .b-act { background: var(--attn-soft); color: var(--attn); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 18px; }
+  .leg { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-soft); }
+  .leg .dot { width: 12px; height: 12px; border-radius: 3px; }
+
+  .foot {
+    margin-top: 44px; padding: 18px 20px; border-radius: 12px;
+    background: var(--accent-soft); border: 1px solid var(--line);
+    font-size: 13.5px; color: var(--ink); line-height: 1.7;
+  }
+  .foot code { font-family: var(--mono); background: var(--panel); padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); font-size: 12.5px; }
+  .foot b { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Parameter Anatomy</div>
+    <h1>一层 Transformer 的参数是怎么构成的</h1>
+    <p class="sub">每一层都由「注意力」和「FFN」两块组成。下面用一个具体例子把每个权重矩阵拆开,你能看清每份参数从哪来、怎么算。例子取 <b>d=4096，H=32，head_dim=128，kv=8</b>。</p>
+  </header>
+
+  <!-- MASTER FORMULA -->
+  <section>
+    <h2>总装公式</h2>
+    <div class="master">
+      <span class="tok t-embed">Embedding</span>
+      <span class="op">+</span>
+      <span class="op">L ×</span>
+      <span class="op">(</span>
+      <span class="tok t-attn">注意力</span>
+      <span class="op">+</span>
+      <span class="tok t-ffn">FFN</span>
+      <span class="op">)</span>
+      <span class="note-inline">Embedding 在<b>层外</b>,只加一次(tie 决定 ×1 还是 ×2);括号里的一层要 <b>× 层数 L</b>。norm / router 很小,决定量级时可忽略。</span>
+    </div>
+  </section>
+
+  <!-- ATTENTION -->
+  <section>
+    <h2>① 注意力块 · 每层 4 个投影</h2>
+    <div class="card">
+      <div class="card-head">
+        <span class="dot" style="background:var(--attn)"></span>
+        <span class="card-title">Attention</span>
+        <span class="card-tag">每个投影 = 输入维 × 输出维</span>
+      </div>
+      <div class="rows">
+        <div class="row">
+          <span class="pname" style="color:var(--attn)">q_proj</span>
+          <span class="flow"><span class="pill">d=4096</span><span class="arrow">→</span><span class="pill">H·dₕ = 32×128 = 4096</span></span>
+          <span class="pcount">16.8M</span>
+        </div>
+        <div class="row">
+          <span class="pname" style="color:var(--attn)">k_proj</span>
+          <span class="flow"><span class="pill">d=4096</span><span class="arrow">→</span><span class="pill">kv·dₕ = 8×128 = 1024</span></span>
+          <span class="pcount">4.2M</span>
+        </div>
+        <div class="row">
+          <span class="pname" style="color:var(--attn)">v_proj</span>
+          <span class="flow"><span class="pill">d=4096</span><span class="arrow">→</span><span class="pill">kv·dₕ = 8×128 = 1024</span></span>
+          <span class="pcount">4.2M</span>
+        </div>
+        <div class="row">
+          <span class="pname" style="color:var(--attn)">o_proj</span>
+          <span class="flow"><span class="pill">H·dₕ = 4096</span><span class="arrow">→</span><span class="pill">d=4096</span></span>
+          <span class="pcount">16.8M</span>
+        </div>
+      </div>
+      <div class="expl">
+        <b>GQA 的关键</b>:q / o 用全部 32 个头,k / v 只有 8 个 kv 头,所以 k / v 各只有 q 的 1/4。<b>永远别漏 head_dim</b>——输出维是「头数 × head_dim」,不是头数本身。
+      </div>
+      <div class="subtotal"><span style="color:var(--ink-soft)">一层注意力小计</span><b style="color:var(--attn)">≈ 42.0M</b></div>
+    </div>
+  </section>
+
+  <!-- FFN -->
+  <section>
+    <h2>② FFN 块 · 两种形态(二选一)</h2>
+    <div class="grid2">
+      <!-- dense -->
+      <div class="card">
+        <div class="card-head">
+          <span class="dot" style="background:var(--ffn)"></span>
+          <span class="card-title">Dense FFN</span>
+          <span class="card-tag">gated → 3 个矩阵</span>
+        </div>
+        <div class="rows">
+          <div class="row"><span class="pname" style="color:var(--ffn)">gate</span><span class="flow"><span class="pill">d → I</span></span><span class="pcount">d×I</span></div>
+          <div class="row"><span class="pname" style="color:var(--ffn)">up</span><span class="flow"><span class="pill">d → I</span></span><span class="pcount">d×I</span></div>
+          <div class="row"><span class="pname" style="color:var(--ffn)">down</span><span class="flow"><span class="pill">I → d</span></span><span class="pcount">I×d</span></div>
+        </div>
+        <div class="expl">两个升维(gate、up)+ 一个降维(down)。silu/gelu 门控一律 <b>×3</b>;老式 ReLU MLP 只有 up+down = ×2。</div>
+        <div class="subtotal"><span style="color:var(--ink-soft)">合计</span><b style="color:var(--ffn)">3 × d × I</b></div>
+      </div>
+
+      <!-- moe -->
+      <div class="card">
+        <div class="card-head">
+          <span class="dot" style="background:var(--ffn)"></span>
+          <span class="card-title">MoE FFN</span>
+          <span class="card-tag">多个专家 + 挑选器</span>
+        </div>
+        <div>
+          <div class="moe-part">
+            <span class="bar" style="background:var(--ffn)"></span>
+            <span><span class="moe-label" style="color:var(--ffn)">路由专家 ×N</span><br><span class="moe-formula">3 × d × moe_I × N</span></span>
+            <span class="moe-count">大头</span>
+          </div>
+          <div class="moe-part">
+            <span class="bar" style="background:var(--shared)"></span>
+            <span><span class="moe-label" style="color:var(--shared)">共享专家 ×S</span><br><span class="moe-formula">3 × d × shared_I × S</span></span>
+            <span class="moe-count">每次都走</span>
+          </div>
+          <div class="moe-part">
+            <span class="bar" style="background:var(--router)"></span>
+            <span><span class="moe-label" style="color:var(--router)">router / gate</span><br><span class="moe-formula">d × N</span></span>
+            <span class="moe-count">很小</span>
+          </div>
+        </div>
+        <div class="expl">每个专家自己就是一个 gated FFN(<b>×3、×d</b> 都不能漏)。专家 FFN 用 <code style="font-family:var(--mono)">moe_intermediate_size</code>,通常比 dense 的 I 小很多,靠数量取胜。</div>
+      </div>
+    </div>
+    <div class="legend">
+      <span class="leg"><span class="dot" style="background:var(--ffn)"></span>路由专家(专精,选 top-k 才走)</span>
+      <span class="leg"><span class="dot" style="background:var(--shared)"></span>共享专家(通用,每 token 必走)</span>
+      <span class="leg"><span class="dot" style="background:var(--router)"></span>router(挑专家的打分器,dense 没有)</span>
+    </div>
+  </section>
+
+  <!-- TOTAL vs ACTIVATED -->
+  <section>
+    <h2>③ MoE 的两个数:总参数 vs 激活参数</h2>
+    <div class="compare">
+      <div class="cbox">
+        <span class="badge b-total">TOTAL 总参数</span>
+        <div class="big" style="color:var(--ffn); margin-top:10px;">全部 N 个专家</div>
+        <p class="cap">不做筛选,把所有专家都算进去。决定模型「有多大 / 占多少显存」。</p>
+        <div style="font-family:var(--mono); font-size:12.5px; color:var(--ink-soft); margin-top:10px; line-height:1.9;">路由 <b style="color:var(--ffn)">×N</b> + 共享 ×S + router</div>
+      </div>
+      <div class="cbox">
+        <span class="badge b-act">ACTIVATED 激活参数</span>
+        <div class="big" style="color:var(--attn); margin-top:10px;">只有 top-k 个专家</div>
+        <p class="cap">每个 token 实际走过的。决定「算得多快 / 单次前向的计算量」。</p>
+        <div style="font-family:var(--mono); font-size:12.5px; color:var(--ink-soft); margin-top:10px; line-height:1.9;">路由 <b style="color:var(--attn)">×k</b> + 共享 ×S + router + 注意力</div>
+      </div>
+    </div>
+    <p class="sub" style="margin-top:16px;">两者唯一的区别:总参数用 <b>N</b>(全部专家),激活参数用 <b>k</b>(top-k)。注意力、共享专家、router、dense 层在两个数里<b>都全额计入</b>。这就是 <code style="font-family:var(--mono); background:var(--panel); padding:1px 6px; border-radius:5px; border:1px solid var(--line)">31B-A3B</code> 这种写法的来历。</p>
+  </section>
+
+  <div class="foot">
+    <b>三条肌肉记忆</b><br>
+    1. 每个矩阵 = <code>输入维 × 输出维</code>,注意力别漏 <code>head_dim</code>,专家别漏 <code>d</code>。<br>
+    2. gated FFN = <b>3 个</b>矩阵(gate/up/down);router 和共享专家是 <b>MoE 专有</b>,dense 没有。<br>
+    3. 算完<b>一层</b>立刻 <code>× 层数</code>,再把<b>层外</b>的 embedding 加上(tie=false 则 ×2)。
+  </div>
+</div>
+</body>
+</html>
