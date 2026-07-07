@@ -184,6 +184,34 @@
   }
   .foot code { font-family: var(--mono); background: var(--panel); padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); font-size: 12.5px; }
   .foot b { color: var(--accent); }
+
+  /* calculator */
+  .calc { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .calc-body { padding: 18px; }
+  .calc textarea {
+    width: 100%; min-height: 210px; resize: vertical; font-family: var(--mono); font-size: 12.5px;
+    line-height: 1.65; color: var(--ink); background: var(--bg); border: 1px solid var(--line-strong);
+    border-radius: 10px; padding: 12px 14px; tab-size: 2;
+  }
+  .calc textarea:focus { outline: none; border-color: var(--accent); }
+  .calc-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .btn { font-family: var(--sans); font-size: 13.5px; font-weight: 600; padding: 9px 18px; border-radius: 9px; border: 1px solid transparent; cursor: pointer; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { filter: brightness(1.07); }
+  .btn-ghost { background: transparent; color: var(--ink-soft); border-color: var(--line-strong); }
+  .btn-ghost:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .calc-hint { font-size: 12px; color: var(--ink-faint); margin-left: auto; }
+  .calc-err { color: var(--router); font-size: 13px; font-family: var(--mono); margin-top: 12px; display: none; }
+  .calc-out { margin-top: 18px; display: none; }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 16px; }
+  .chip { font-family: var(--mono); font-size: 11.5px; padding: 3px 9px; border-radius: 7px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--line); }
+  .chip.warn { background: var(--router-soft); color: var(--router); }
+  .chip b { font-weight: 700; }
+  .btable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  .btable th, .btable td { text-align: left; padding: 8px 10px; border-bottom: 1px dashed var(--line); }
+  .btable th { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); font-weight: 600; }
+  .btable td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+  .btable tr.sumrow td { border-top: 1px solid var(--line-strong); border-bottom: none; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -322,6 +350,44 @@
     <p class="sub" style="margin-top:16px;">两者唯一的区别:总参数用 <b>N</b>(全部专家),激活参数用 <b>k</b>(top-k)。注意力、共享专家、router、dense 层在两个数里<b>都全额计入</b>。这就是 <code style="font-family:var(--mono); background:var(--panel); padding:1px 6px; border-radius:5px; border:1px solid var(--line)">31B-A3B</code> 这种写法的来历。</p>
   </section>
 
+  <!-- CALCULATOR -->
+  <section>
+    <h2>④ 自己试 · 贴 config.json 自动算尺寸</h2>
+    <div class="calc">
+      <div class="card-head">
+        <span class="dot" style="background:var(--accent)"></span>
+        <span class="card-title">参数计算器</span>
+        <span class="card-tag">纯前端 · 数据不外传</span>
+      </div>
+      <div class="calc-body">
+        <textarea id="cfg" spellcheck="false" placeholder='把 HuggingFace 的 config.json 整段粘进来，点「解析并计算」。&#10;支持 dense 与 MoE（Qwen / DeepSeek / Mixtral 命名都认），允许注释与尾逗号。'></textarea>
+        <div class="calc-actions">
+          <button class="btn btn-primary" id="run">解析并计算</button>
+          <button class="btn btn-ghost" id="demo">载入示例</button>
+          <button class="btn btn-ghost" id="clear">清空</button>
+          <span class="calc-hint">只读关键超参，一切在你浏览器里算</span>
+        </div>
+        <div class="calc-err" id="err"></div>
+        <div class="calc-out" id="out">
+          <div class="chips" id="chips"></div>
+          <div class="compare">
+            <div class="cbox">
+              <span class="badge b-total">TOTAL 总参数</span>
+              <div class="big" id="bigTotal" style="color:var(--ffn); margin-top:10px;">—</div>
+              <p class="cap" id="capTotal"></p>
+            </div>
+            <div class="cbox">
+              <span class="badge b-act">ACTIVATED 激活参数</span>
+              <div class="big" id="bigAct" style="color:var(--attn); margin-top:10px;">—</div>
+              <p class="cap" id="capAct"></p>
+            </div>
+          </div>
+          <table class="btable" id="breakdown"></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <div class="foot">
     <b>三条肌肉记忆</b><br>
     1. 每个矩阵 = <code>输入维 × 输出维</code>,注意力别漏 <code>head_dim</code>,专家别漏 <code>d</code>。<br>
@@ -329,5 +395,158 @@
     3. 算完<b>一层</b>立刻 <code>× 层数</code>,再把<b>层外</b>的 embedding 加上(tie=false 则 ×2)。
   </div>
 </div>
+
+<script>
+(function(){
+  const DEMO = `{
+  "architectures": ["Qwen2MoeForCausalLM"],
+  "hidden_size": 2048,
+  "num_hidden_layers": 24,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 4,
+  "head_dim": 128,
+  "num_experts": 64,
+  "num_experts_per_tok": 8,
+  "moe_intermediate_size": 1408,
+  "shared_expert_intermediate_size": 5632,
+  "decoder_sparse_step": 1,
+  "hidden_act": "silu",
+  "vocab_size": 151936,
+  "tie_word_embeddings": false
+}`;
+  const $ = id => document.getElementById(id);
+
+  // tolerate // and /* */ comments and trailing commas so raw configs paste cleanly
+  function looseParse(txt){
+    let t = txt.trim();
+    t = t.replace(/\/\*[\s\S]*?\*\//g, '');
+    t = t.replace(/(^|[^:"'\\])\/\/[^\n\r]*/g, '$1');
+    t = t.replace(/,(\s*[}\]])/g, '$1');
+    return JSON.parse(t);
+  }
+
+  const pick = (o, keys) => { for(const k of keys){ if(o[k]!==undefined && o[k]!==null) return o[k]; } return undefined; };
+  function fmt(n){
+    if(!isFinite(n)) return '—';
+    if(n>=1e9) return (n/1e9).toFixed(2)+'B';
+    if(n>=1e6) return (n/1e6).toFixed(1)+'M';
+    if(n>=1e3) return (n/1e3).toFixed(1)+'K';
+    return String(Math.round(n));
+  }
+
+  function compute(c){
+    const warn = [];
+    const d = pick(c,['hidden_size','n_embd','d_model','dim']);
+    const L = pick(c,['num_hidden_layers','n_layer','num_layers']);
+    const H = pick(c,['num_attention_heads','n_head','num_heads']);
+    const V = pick(c,['vocab_size']);
+    const missing = [];
+    if(d===undefined) missing.push('hidden_size');
+    if(L===undefined) missing.push('num_hidden_layers');
+    if(H===undefined) missing.push('num_attention_heads');
+    if(V===undefined) missing.push('vocab_size');
+    if(missing.length) throw new Error('缺少关键字段: '+missing.join(', '));
+
+    const kv = pick(c,['num_key_value_heads','num_kv_heads']) ?? H;
+    const headDim = pick(c,['head_dim','head_size']) ?? Math.round(d/H);
+    let tie = pick(c,['tie_word_embeddings','tie_weights']);
+    if(tie===undefined){ tie = false; warn.push('tie_word_embeddings 缺省，按 false（不共享）'); }
+
+    const N = pick(c,['num_experts','num_local_experts','n_routed_experts','moe_num_experts']);
+    const isMoe = N!==undefined && N>0;
+    const topk = pick(c,['num_experts_per_tok','n_activated_experts','moe_topk','num_selected_experts']) ?? (isMoe?2:0);
+    const I = pick(c,['intermediate_size','ffn_dim','n_inner']);
+    const expertI = pick(c,['moe_intermediate_size','expert_intermediate_size']) ?? I;
+
+    let sharedI = pick(c,['shared_expert_intermediate_size']);
+    let S = sharedI!==undefined ? 1 : 0;
+    const nShared = pick(c,['n_shared_experts','num_shared_experts']);
+    if(nShared!==undefined && nShared>0){ S = nShared; sharedI = pick(c,['moe_intermediate_size']) ?? expertI; }
+
+    const step = pick(c,['decoder_sparse_step','moe_layer_freq']) ?? 1;
+    const firstDense = pick(c,['first_k_dense_replace']) ?? 0;
+    const mlpOnly = new Set(Array.isArray(c.mlp_only_layers)? c.mlp_only_layers : []);
+    let moeLayers = 0, denseLayers = 0;
+    for(let i=0;i<L;i++){
+      const asMoe = isMoe && i>=firstDense && !mlpOnly.has(i) && ((i+1)%step===0);
+      if(asMoe) moeLayers++; else denseLayers++;
+    }
+
+    const act = String(pick(c,['hidden_act','hidden_activation','activation_function'])||'silu').toLowerCase();
+    const gated = act !== 'relu';           // modern LLMs are gated SwiGLU/GeGLU → ×3
+    const mult = gated ? 3 : 2;
+
+    if(pick(c,['kv_lora_rank','q_lora_rank'])!==undefined)
+      warn.push('检测到 MLA（kv_lora_rank），注意力按标准 GQA 近似，略有偏差');
+    if(denseLayers>0 && I===undefined)
+      warn.push('有 dense 层但缺 intermediate_size，dense FFN 记为 0');
+
+    const attn = (2*(H*headDim)*d + 2*(kv*headDim)*d) * L;
+    const denseFFN = mult * d * (I||0) * denseLayers;
+    const expertsTot = isMoe ? mult*d*expertI*N*moeLayers : 0;
+    const expertsAct = isMoe ? mult*d*expertI*Math.min(topk,N)*moeLayers : 0;
+    const shared = (isMoe && S>0 && sharedI) ? mult*d*sharedI*S*moeLayers : 0;
+    const router = isMoe ? d*N*moeLayers : 0;
+    const emb = V*d*(tie?1:2);
+
+    const total  = emb + attn + denseFFN + expertsTot + shared + router;
+    const active = emb + attn + denseFFN + expertsAct + shared + router;
+
+    return {
+      isMoe, warn,
+      params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie},
+      rows:[
+        ['Embedding'+(tie?'（tied ×1）':'（×2）'), emb, emb],
+        ['Attention（×'+L+' 层）', attn, attn],
+        denseLayers ? ['Dense FFN（×'+denseLayers+' 层）', denseFFN, denseFFN] : null,
+        isMoe ? ['路由专家（总 N='+N+' / 激活 '+Math.min(topk,N)+'）', expertsTot, expertsAct] : null,
+        (isMoe && shared) ? ['共享专家 ×'+S, shared, shared] : null,
+        isMoe ? ['Router', router, router] : null,
+      ].filter(Boolean),
+      total, active
+    };
+  }
+
+  function render(r){
+    const p = r.params, chips = [];
+    const add = (k,v)=> chips.push('<span class="chip"><b>'+k+'</b> '+v+'</span>');
+    add('d', p.d); add('L', p.L); add('heads', p.H+'/'+p.kv+' q/kv'); add('head_dim', p.headDim);
+    add('vocab', p.V); if(p.I) add('I', p.I);
+    if(r.isMoe){ add('experts', p.N+' · top'+p.topk); add('moe_I', p.expertI); if(p.S) add('shared', p.S+'×'+p.sharedI); add('MoE 层', p.moeLayers+'/'+p.L); }
+    let html = chips.join('');
+    r.warn.forEach(w => html += '<span class="chip warn">⚠ '+w+'</span>');
+    $('chips').innerHTML = html;
+
+    $('bigTotal').textContent = fmt(r.total);
+    $('bigAct').textContent   = r.isMoe ? fmt(r.active) : fmt(r.total);
+    $('capTotal').textContent = '全部权重，决定占多少显存。';
+    $('capAct').textContent   = r.isMoe ? ('每 token 实际走过（top-'+p.topk+'），决定算多快。') : 'dense 模型：激活 = 总参数。';
+
+    let t = '<tr><th>组成</th><th style="text-align:right">总参数</th><th style="text-align:right">激活</th></tr>';
+    r.rows.forEach(row => {
+      t += '<tr><td>'+row[0]+'</td><td class="num">'+fmt(row[1])+'</td><td class="num">'+(row[1]===row[2]?'—':fmt(row[2]))+'</td></tr>';
+    });
+    t += '<tr class="sumrow"><td>合计</td><td class="num">'+fmt(r.total)+'</td><td class="num">'+(r.isMoe?fmt(r.active):'—')+'</td></tr>';
+    $('breakdown').innerHTML = t;
+
+    $('out').style.display = 'block';
+    $('err').style.display = 'none';
+  }
+
+  function showErr(m){ $('err').textContent = '⚠ '+m; $('err').style.display = 'block'; $('out').style.display = 'none'; }
+
+  function run(){
+    const txt = $('cfg').value.trim();
+    if(!txt){ showErr('先粘贴一段 config.json'); return; }
+    let c;
+    try{ c = looseParse(txt); }catch(e){ showErr('JSON 解析失败：'+e.message); return; }
+    try{ render(compute(c)); }catch(e){ showErr(e.message); }
+  }
+
+  $('run').addEventListener('click', run);
+  $('demo').addEventListener('click', ()=>{ $('cfg').value = DEMO; run(); });
+  $('clear').addEventListener('click', ()=>{ $('cfg').value=''; $('out').style.display='none'; $('err').style.display='none'; $('cfg').focus(); });
+})();
+</script>
 </body>
 </html>
