@@ -434,8 +434,11 @@
     return String(Math.round(n));
   }
 
-  function compute(c){
+  function compute(cRaw){
     const warn = [];
+    // multimodal configs nest the LLM under text_config — descend into it
+    const c = cRaw.text_config ? Object.assign({}, cRaw, cRaw.text_config) : cRaw;
+    const hasVision = !!(cRaw.vision_config || c.vision_config);
     const d = pick(c,['hidden_size','n_embd','d_model','dim']);
     const L = pick(c,['num_hidden_layers','n_layer','num_layers']);
     const H = pick(c,['num_attention_heads','n_head','num_heads']);
@@ -480,8 +483,30 @@
       warn.push('检测到 MLA（kv_lora_rank），注意力按标准 GQA 近似，略有偏差');
     if(denseLayers>0 && I===undefined)
       warn.push('有 dense 层但缺 intermediate_size，dense FFN 记为 0');
+    if(hasVision) warn.push('检测到 vision_config：只计语言模型，视觉塔未计入');
+    const mtpN = pick(c,['mtp_num_hidden_layers']);
+    if(mtpN) warn.push('含 MTP 预测层（mtp_num_hidden_layers='+mtpN+'），未计入');
 
-    const attn = (2*(H*headDim)*d + 2*(kv*headDim)*d) * L;
+    // attention: split full vs linear (GatedDeltaNet) when layer_types is given
+    const attnGate = c.attn_output_gate === true;      // Qwen3-Next output gate: +1 proj
+    const fullPer = 2*(H*headDim)*d + 2*(kv*headDim)*d + (attnGate ? (H*headDim)*d : 0);
+    const layerTypes = Array.isArray(c.layer_types) ? c.layer_types : null;
+    let attn, attnLabel;
+    if(layerTypes){
+      const nFull = layerTypes.filter(x=>/full/.test(x)).length;
+      const nLin  = layerTypes.filter(x=>/linear/.test(x)).length;
+      const Kh=pick(c,['linear_num_key_heads'])||0, Kd=pick(c,['linear_key_head_dim'])||0;
+      const Vh=pick(c,['linear_num_value_heads'])||0, Vd=pick(c,['linear_value_head_dim'])||0;
+      const ck=pick(c,['linear_conv_kernel_dim'])||0;
+      const qk=Kh*Kd, vv=Vh*Vd;               // q/k proj → qk, v/out proj → vv, +conv +gate
+      const linPer = d*qk*2 + d*vv*2 + (c.output_gate_type ? d*vv : 0) + (2*qk+vv)*ck;
+      attn = fullPer*nFull + linPer*nLin;
+      attnLabel = 'Attention（'+nFull+' full + '+nLin+' linear）';
+      if(nLin>0) warn.push('linear_attention 层按 GatedDeltaNet 近似计（'+nLin+' 层），略有偏差');
+    } else {
+      attn = fullPer * L;
+      attnLabel = 'Attention（×'+L+' 层）';
+    }
     const denseFFN = mult * d * (I||0) * denseLayers;
     const expertsTot = isMoe ? mult*d*expertI*N*moeLayers : 0;
     const expertsAct = isMoe ? mult*d*expertI*Math.min(topk,N)*moeLayers : 0;
@@ -497,7 +522,7 @@
       params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie},
       rows:[
         ['Embedding'+(tie?'（tied ×1）':'（×2）'), emb, emb],
-        ['Attention（×'+L+' 层）', attn, attn],
+        [attnLabel, attn, attn],
         denseLayers ? ['Dense FFN（×'+denseLayers+' 层）', denseFFN, denseFFN] : null,
         isMoe ? ['路由专家（总 N='+N+' / 激活 '+Math.min(topk,N)+'）', expertsTot, expertsAct] : null,
         (isMoe && shared) ? ['共享专家 ×'+S, shared, shared] : null,
