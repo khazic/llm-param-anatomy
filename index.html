@@ -509,8 +509,8 @@
       const Kh=pick(c,['linear_num_key_heads'])||0, Kd=pick(c,['linear_key_head_dim'])||0;
       const Vh=pick(c,['linear_num_value_heads'])||0, Vd=pick(c,['linear_value_head_dim'])||0;
       const ck=pick(c,['linear_conv_kernel_dim'])||0;
-      const qk=Kh*Kd, vv=Vh*Vd;               // q/k proj → qk, v/out proj → vv, +conv +gate
-      const linPer = d*qk*2 + d*vv*2 + (c.output_gate_type ? d*vv : 0) + (2*qk+vv)*ck;
+      const qk=Kh*Kd, vv=Vh*Vd;               // GatedDeltaNet: in_proj_qkvz = q,k (2·d·qk) + v,z (2·d·vv), out_proj (d·vv), conv over (2·qk+vv)
+      const linPer = d*qk*2 + d*vv*3 + (2*qk+vv)*ck;
       attn = fullPer*nFull + linPer*nLin;
       attnLabel = 'Attention（'+nFull+' full + '+nLin+' linear）';
       attnF = nFull+'×full('+fmt(fullPer)+'/层) + '+nLin+'×linear(≈'+fmt(linPer)+'/层，GatedDeltaNet)';
@@ -544,12 +544,12 @@
       } else { warn.push('vision_config 字段不足，视觉塔未计入'); }
     }
 
-    // MTP layer(s) — one transformer block (full attn + MoE) + eh_proj (2d×d), counted into TOTAL
+    // MTP layer(s) — one transformer block (full attn + FFN/MoE) + eh_proj (2d×d), counted into TOTAL
     let mtp = 0, mtpF = '';
-    if(mtpN>0 && isMoe){
-      const moePer = mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S : 0) + d*N;
-      mtp = mtpN * (fullPer + moePer + 2*d*d);
-      mtpF = mtpN+' × (full attn '+fmt(fullPer)+' + MoE 层 '+fmt(moePer)+' + eh_proj 2·'+d+'²)';
+    if(mtpN>0){
+      const ffnPer = isMoe ? (mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S : 0) + d*N) : (mult*d*(I||0));
+      mtp = mtpN * (fullPer + ffnPer + 2*d*d);
+      mtpF = mtpN+' × (full attn '+fmt(fullPer)+' + '+(isMoe?'MoE 层 ':'FFN ')+fmt(ffnPer)+' + eh_proj 2·'+d+'²)';
     }
     if(vision || mtp) warn.push('视觉塔 / MTP 已计入总参数；激活参数按纯文本前向计，故其激活列记 0');
 
