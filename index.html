@@ -208,9 +208,11 @@
   .chip.warn { background: var(--router-soft); color: var(--router); }
   .chip b { font-weight: 700; }
   .btable { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
-  .btable th, .btable td { text-align: left; padding: 8px 10px; border-bottom: 1px dashed var(--line); }
+  .btable th, .btable td { text-align: left; padding: 8px 10px; border-bottom: 1px dashed var(--line); vertical-align: top; }
   .btable th { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); font-weight: 600; }
-  .btable td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+  .btable td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bname { font-weight: 600; }
+  .bformula { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-top: 3px; line-height: 1.5; }
   .btable tr.sumrow td { border-top: 1px solid var(--line-strong); border-bottom: none; font-weight: 700; }
   .modebar { display: none; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
   .modebar-label { font-size: 12.5px; color: var(--ink-soft); }
@@ -498,8 +500,9 @@
     // attention: split full vs linear (GatedDeltaNet) when layer_types is given
     const attnGate = c.attn_output_gate === true;      // Qwen3-Next output gate: +1 proj
     const fullPer = 2*(H*headDim)*d + 2*(kv*headDim)*d + (attnGate ? (H*headDim)*d : 0);
+    const fullExpr = 'q/o 2·('+H+'·'+headDim+')·'+d+' + k/v 2·('+kv+'·'+headDim+')·'+d + (attnGate ? ' + gate '+H+'·'+headDim+'·'+d : '');
     const layerTypes = Array.isArray(c.layer_types) ? c.layer_types : null;
-    let attn, attnLabel;
+    let attn, attnLabel, attnF;
     if(layerTypes){
       const nFull = layerTypes.filter(x=>/full/.test(x)).length;
       const nLin  = layerTypes.filter(x=>/linear/.test(x)).length;
@@ -510,10 +513,12 @@
       const linPer = d*qk*2 + d*vv*2 + (c.output_gate_type ? d*vv : 0) + (2*qk+vv)*ck;
       attn = fullPer*nFull + linPer*nLin;
       attnLabel = 'Attention（'+nFull+' full + '+nLin+' linear）';
+      attnF = nFull+'×full('+fmt(fullPer)+'/层) + '+nLin+'×linear(≈'+fmt(linPer)+'/层，GatedDeltaNet)';
       if(nLin>0) warn.push('linear_attention 层按 GatedDeltaNet 近似计（'+nLin+' 层），略有偏差');
     } else {
       attn = fullPer * L;
       attnLabel = 'Attention（×'+L+' 层）';
+      attnF = L+' 层 × ['+fullExpr+']';
     }
     const denseFFN = mult * d * (I||0) * denseLayers;
     const expertsTot = isMoe ? mult*d*expertI*N*moeLayers : 0;
@@ -524,7 +529,7 @@
 
     // vision tower — a ViT: counted into TOTAL (not on the text-token active path)
     const vc = cRaw.vision_config || c.vision_config;
-    let vision = 0;
+    let vision = 0, visionF = '';
     if(vc){
       const vh=pick(vc,['hidden_size']), vL=pick(vc,['depth','num_hidden_layers']), vI=pick(vc,['intermediate_size']);
       if(vh && vL && vI){
@@ -533,18 +538,18 @@
         const vout=pick(vc,['out_hidden_size'])||vh, vpos=pick(vc,['num_position_embeddings'])||0;
         const vgated=/glu/.test(String(pick(vc,['hidden_act'])||'gelu').toLowerCase()) ? 3 : 2;
         const vctx=vh*vmerge*vmerge;
-        vision = (4*vh*vh + vgated*vh*vI)*vL   // transformer blocks (attn qkvo + mlp)
-               + vin*vt*vpatch*vpatch*vh        // patch embed
-               + vpos*vh                        // position embed
-               + vctx*vctx + vctx*vout;         // patch merger MLP
+        const vblocks=(4*vh*vh + vgated*vh*vI)*vL, vpe=vin*vt*vpatch*vpatch*vh, vpos2=vpos*vh, vmerger=vctx*vctx+vctx*vout;
+        vision = vblocks + vpe + vpos2 + vmerger;
+        visionF = 'ViT '+vL+'层×(4·'+vh+'² + '+vgated+'·'+vh+'·'+vI+')='+fmt(vblocks)+' + patch/pos '+fmt(vpe+vpos2)+' + merger '+fmt(vmerger);
       } else { warn.push('vision_config 字段不足，视觉塔未计入'); }
     }
 
     // MTP layer(s) — one transformer block (full attn + MoE) + eh_proj (2d×d), counted into TOTAL
-    let mtp = 0;
+    let mtp = 0, mtpF = '';
     if(mtpN>0 && isMoe){
       const moePer = mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S : 0) + d*N;
       mtp = mtpN * (fullPer + moePer + 2*d*d);
+      mtpF = mtpN+' × (full attn '+fmt(fullPer)+' + MoE 层 '+fmt(moePer)+' + eh_proj 2·'+d+'²)';
     }
     if(vision || mtp) warn.push('视觉塔 / MTP 已计入总参数；激活参数按纯文本前向计，故其激活列记 0');
 
@@ -556,14 +561,14 @@
       isMoe, warn, hasExtra: !!(vision || mtp),
       params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie,vision,mtp,mtpN},
       rows:[
-        ['Embedding'+(tie?'（tied ×1）':'（×2）'), emb, emb],
-        [attnLabel, attn, attn],
-        denseLayers ? ['Dense FFN（×'+denseLayers+' 层）', denseFFN, denseFFN] : null,
-        isMoe ? ['路由专家（总 N='+N+' / 激活 '+Math.min(topk,N)+'）', expertsTot, expertsAct] : null,
-        (isMoe && shared) ? ['共享专家 ×'+S, shared, shared] : null,
-        isMoe ? ['Router', router, router] : null,
-        vision ? ['Vision 塔（视觉编码器）', vision, 0, 'extra'] : null,
-        mtp ? ['MTP 预测层 ×'+mtpN, mtp, 0, 'extra'] : null,
+        {label:'Embedding'+(tie?'（tied ×1）':'（×2）'), f:(tie ? (V+' × '+d+'（vocab × d，tied 共享）') : ('2 × '+V+' × '+d+'（vocab × d，embed + lm_head）')), total:emb, active:emb},
+        {label:attnLabel, f:attnF, total:attn, active:attn},
+        denseLayers ? {label:'Dense FFN（×'+denseLayers+' 层）', f:denseLayers+' 层 × '+mult+'·'+d+'·'+I+'（gate/up/down）', total:denseFFN, active:denseFFN} : null,
+        isMoe ? {label:'路由专家', f:moeLayers+' 层 × '+mult+'·'+d+'·'+expertI+' × '+N+' experts（激活取 top-'+Math.min(topk,N)+'）', total:expertsTot, active:expertsAct} : null,
+        (isMoe && shared) ? {label:'共享专家 ×'+S, f:moeLayers+' 层 × '+mult+'·'+d+'·'+sharedI+' × '+S, total:shared, active:shared} : null,
+        isMoe ? {label:'Router', f:moeLayers+' 层 × '+d+'×'+N, total:router, active:router} : null,
+        vision ? {label:'Vision 塔（视觉编码器）', f:visionF, total:vision, active:0, extra:true} : null,
+        mtp ? {label:'MTP 预测层 ×'+mtpN, f:mtpF, total:mtp, active:0, extra:true} : null,
       ].filter(Boolean),
       total, active, llmTotal
     };
@@ -587,7 +592,7 @@
     $('modebar').style.display = r.hasExtra ? 'flex' : 'none';
     const llmOnly = r.hasExtra && mode === 'llm';
     const shownTotal = llmOnly ? r.llmTotal : r.total;
-    const rows = llmOnly ? r.rows.filter(row => row[3] !== 'extra') : r.rows;
+    const rows = llmOnly ? r.rows.filter(row => !row.extra) : r.rows;
 
     $('bigTotal').textContent = fmt(shownTotal);
     $('bigAct').textContent   = r.isMoe ? fmt(r.active) : fmt(shownTotal);
@@ -596,7 +601,8 @@
 
     let t = '<tr><th>组成</th><th style="text-align:right">总参数</th><th style="text-align:right">激活</th></tr>';
     rows.forEach(row => {
-      t += '<tr><td>'+row[0]+'</td><td class="num">'+fmt(row[1])+'</td><td class="num">'+(row[1]===row[2]?'—':fmt(row[2]))+'</td></tr>';
+      const name = '<div class="bname">'+row.label+'</div>' + (row.f ? '<div class="bformula">'+row.f+'</div>' : '');
+      t += '<tr><td>'+name+'</td><td class="num">'+fmt(row.total)+'</td><td class="num">'+(row.total===row.active?'—':fmt(row.active))+'</td></tr>';
     });
     t += '<tr class="sumrow"><td>合计</td><td class="num">'+fmt(shownTotal)+'</td><td class="num">'+(r.isMoe?fmt(r.active):'—')+'</td></tr>';
     $('breakdown').innerHTML = t;
