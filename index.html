@@ -483,9 +483,7 @@
       warn.push('检测到 MLA（kv_lora_rank），注意力按标准 GQA 近似，略有偏差');
     if(denseLayers>0 && I===undefined)
       warn.push('有 dense 层但缺 intermediate_size，dense FFN 记为 0');
-    if(hasVision) warn.push('检测到 vision_config：只计语言模型，视觉塔未计入');
-    const mtpN = pick(c,['mtp_num_hidden_layers']);
-    if(mtpN) warn.push('含 MTP 预测层（mtp_num_hidden_layers='+mtpN+'），未计入');
+    const mtpN = pick(c,['mtp_num_hidden_layers']) || 0;
 
     // attention: split full vs linear (GatedDeltaNet) when layer_types is given
     const attnGate = c.attn_output_gate === true;      // Qwen3-Next output gate: +1 proj
@@ -514,12 +512,38 @@
     const router = isMoe ? d*N*moeLayers : 0;
     const emb = V*d*(tie?1:2);
 
-    const total  = emb + attn + denseFFN + expertsTot + shared + router;
-    const active = emb + attn + denseFFN + expertsAct + shared + router;
+    // vision tower — a ViT: counted into TOTAL (not on the text-token active path)
+    const vc = cRaw.vision_config || c.vision_config;
+    let vision = 0;
+    if(vc){
+      const vh=pick(vc,['hidden_size']), vL=pick(vc,['depth','num_hidden_layers']), vI=pick(vc,['intermediate_size']);
+      if(vh && vL && vI){
+        const vpatch=pick(vc,['patch_size'])||14, vt=pick(vc,['temporal_patch_size'])||1;
+        const vin=pick(vc,['in_channels','num_channels'])||3, vmerge=pick(vc,['spatial_merge_size'])||1;
+        const vout=pick(vc,['out_hidden_size'])||vh, vpos=pick(vc,['num_position_embeddings'])||0;
+        const vgated=/glu/.test(String(pick(vc,['hidden_act'])||'gelu').toLowerCase()) ? 3 : 2;
+        const vctx=vh*vmerge*vmerge;
+        vision = (4*vh*vh + vgated*vh*vI)*vL   // transformer blocks (attn qkvo + mlp)
+               + vin*vt*vpatch*vpatch*vh        // patch embed
+               + vpos*vh                        // position embed
+               + vctx*vctx + vctx*vout;         // patch merger MLP
+      } else { warn.push('vision_config 字段不足，视觉塔未计入'); }
+    }
+
+    // MTP layer(s) — one transformer block (full attn + MoE) + eh_proj (2d×d), counted into TOTAL
+    let mtp = 0;
+    if(mtpN>0 && isMoe){
+      const moePer = mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S : 0) + d*N;
+      mtp = mtpN * (fullPer + moePer + 2*d*d);
+    }
+    if(vision || mtp) warn.push('视觉塔 / MTP 已计入总参数；激活参数按纯文本前向计，故其激活列记 0');
+
+    const active = emb + attn + denseFFN + expertsAct + shared + router;   // text-token forward
+    const total  = emb + attn + denseFFN + expertsTot + shared + router + vision + mtp;
 
     return {
       isMoe, warn,
-      params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie},
+      params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie,vision,mtp,mtpN},
       rows:[
         ['Embedding'+(tie?'（tied ×1）':'（×2）'), emb, emb],
         [attnLabel, attn, attn],
@@ -527,6 +551,8 @@
         isMoe ? ['路由专家（总 N='+N+' / 激活 '+Math.min(topk,N)+'）', expertsTot, expertsAct] : null,
         (isMoe && shared) ? ['共享专家 ×'+S, shared, shared] : null,
         isMoe ? ['Router', router, router] : null,
+        vision ? ['Vision 塔（视觉编码器）', vision, 0] : null,
+        mtp ? ['MTP 预测层 ×'+mtpN, mtp, 0] : null,
       ].filter(Boolean),
       total, active
     };
@@ -538,6 +564,7 @@
     add('d', p.d); add('L', p.L); add('heads', p.H+'/'+p.kv+' q/kv'); add('head_dim', p.headDim);
     add('vocab', p.V); if(p.I) add('I', p.I);
     if(r.isMoe){ add('experts', p.N+' · top'+p.topk); add('moe_I', p.expertI); if(p.S) add('shared', p.S+'×'+p.sharedI); add('MoE 层', p.moeLayers+'/'+p.L); }
+    if(p.vision) add('vision', fmt(p.vision)); if(p.mtp) add('MTP', fmt(p.mtp));
     let html = chips.join('');
     r.warn.forEach(w => html += '<span class="chip warn">⚠ '+w+'</span>');
     $('chips').innerHTML = html;
