@@ -212,6 +212,11 @@
   .btable th { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-faint); font-weight: 600; }
   .btable td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
   .btable tr.sumrow td { border-top: 1px solid var(--line-strong); border-bottom: none; font-weight: 700; }
+  .modebar { display: none; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .modebar-label { font-size: 12.5px; color: var(--ink-soft); }
+  .seg { font-family: var(--sans); font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: transparent; color: var(--ink-soft); cursor: pointer; }
+  .seg:hover { color: var(--ink); }
+  .seg.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -370,6 +375,11 @@
         <div class="calc-err" id="err"></div>
         <div class="calc-out" id="out">
           <div class="chips" id="chips"></div>
+          <div class="modebar" id="modebar">
+            <span class="modebar-label">口径</span>
+            <button class="seg active" id="modeFull" data-mode="full">算全量（LLM + 视觉 + MTP）</button>
+            <button class="seg" id="modeLLM" data-mode="llm">只算 LLM</button>
+          </div>
           <div class="compare">
             <div class="cbox">
               <span class="badge b-total">TOTAL 总参数</span>
@@ -538,11 +548,12 @@
     }
     if(vision || mtp) warn.push('视觉塔 / MTP 已计入总参数；激活参数按纯文本前向计，故其激活列记 0');
 
-    const active = emb + attn + denseFFN + expertsAct + shared + router;   // text-token forward
-    const total  = emb + attn + denseFFN + expertsTot + shared + router + vision + mtp;
+    const active   = emb + attn + denseFFN + expertsAct + shared + router;   // text-token forward
+    const llmTotal = emb + attn + denseFFN + expertsTot + shared + router;   // language model only
+    const total    = llmTotal + vision + mtp;                                // whole checkpoint
 
     return {
-      isMoe, warn,
+      isMoe, warn, hasExtra: !!(vision || mtp),
       params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie,vision,mtp,mtpN},
       rows:[
         ['Embedding'+(tie?'（tied ×1）':'（×2）'), emb, emb],
@@ -551,14 +562,17 @@
         isMoe ? ['路由专家（总 N='+N+' / 激活 '+Math.min(topk,N)+'）', expertsTot, expertsAct] : null,
         (isMoe && shared) ? ['共享专家 ×'+S, shared, shared] : null,
         isMoe ? ['Router', router, router] : null,
-        vision ? ['Vision 塔（视觉编码器）', vision, 0] : null,
-        mtp ? ['MTP 预测层 ×'+mtpN, mtp, 0] : null,
+        vision ? ['Vision 塔（视觉编码器）', vision, 0, 'extra'] : null,
+        mtp ? ['MTP 预测层 ×'+mtpN, mtp, 0, 'extra'] : null,
       ].filter(Boolean),
-      total, active
+      total, active, llmTotal
     };
   }
 
+  let last = null, mode = 'full';   // 'full' = whole checkpoint, 'llm' = language model only
+
   function render(r){
+    last = r;
     const p = r.params, chips = [];
     const add = (k,v)=> chips.push('<span class="chip"><b>'+k+'</b> '+v+'</span>');
     add('d', p.d); add('L', p.L); add('heads', p.H+'/'+p.kv+' q/kv'); add('head_dim', p.headDim);
@@ -569,20 +583,33 @@
     r.warn.forEach(w => html += '<span class="chip warn">⚠ '+w+'</span>');
     $('chips').innerHTML = html;
 
-    $('bigTotal').textContent = fmt(r.total);
-    $('bigAct').textContent   = r.isMoe ? fmt(r.active) : fmt(r.total);
-    $('capTotal').textContent = '全部权重，决定占多少显存。';
+    // mode toggle only matters when there's something outside the LLM (vision / MTP)
+    $('modebar').style.display = r.hasExtra ? 'flex' : 'none';
+    const llmOnly = r.hasExtra && mode === 'llm';
+    const shownTotal = llmOnly ? r.llmTotal : r.total;
+    const rows = llmOnly ? r.rows.filter(row => row[3] !== 'extra') : r.rows;
+
+    $('bigTotal').textContent = fmt(shownTotal);
+    $('bigAct').textContent   = r.isMoe ? fmt(r.active) : fmt(shownTotal);
+    $('capTotal').textContent = llmOnly ? '仅语言模型（不含视觉塔 / MTP），对外标尺寸常用这个。' : '整份 checkpoint 全部权重，决定占多少显存。';
     $('capAct').textContent   = r.isMoe ? ('每 token 实际走过（top-'+p.topk+'），决定算多快。') : 'dense 模型：激活 = 总参数。';
 
     let t = '<tr><th>组成</th><th style="text-align:right">总参数</th><th style="text-align:right">激活</th></tr>';
-    r.rows.forEach(row => {
+    rows.forEach(row => {
       t += '<tr><td>'+row[0]+'</td><td class="num">'+fmt(row[1])+'</td><td class="num">'+(row[1]===row[2]?'—':fmt(row[2]))+'</td></tr>';
     });
-    t += '<tr class="sumrow"><td>合计</td><td class="num">'+fmt(r.total)+'</td><td class="num">'+(r.isMoe?fmt(r.active):'—')+'</td></tr>';
+    t += '<tr class="sumrow"><td>合计</td><td class="num">'+fmt(shownTotal)+'</td><td class="num">'+(r.isMoe?fmt(r.active):'—')+'</td></tr>';
     $('breakdown').innerHTML = t;
 
     $('out').style.display = 'block';
     $('err').style.display = 'none';
+  }
+
+  function setMode(m){
+    mode = m;
+    $('modeFull').classList.toggle('active', m==='full');
+    $('modeLLM').classList.toggle('active', m==='llm');
+    if(last) render(last);
   }
 
   function showErr(m){ $('err').textContent = '⚠ '+m; $('err').style.display = 'block'; $('out').style.display = 'none'; }
@@ -597,7 +624,9 @@
 
   $('run').addEventListener('click', run);
   $('demo').addEventListener('click', ()=>{ $('cfg').value = DEMO; run(); });
-  $('clear').addEventListener('click', ()=>{ $('cfg').value=''; $('out').style.display='none'; $('err').style.display='none'; $('cfg').focus(); });
+  $('clear').addEventListener('click', ()=>{ $('cfg').value=''; $('out').style.display='none'; $('err').style.display='none'; last=null; $('cfg').focus(); });
+  $('modeFull').addEventListener('click', ()=> setMode('full'));
+  $('modeLLM').addEventListener('click', ()=> setMode('llm'));
 })();
 </script>
 </body>
