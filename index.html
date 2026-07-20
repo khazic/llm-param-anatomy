@@ -478,12 +478,21 @@
     const nShared = pick(c,['n_shared_experts','num_shared_experts']);
     if(nShared!==undefined && nShared>0){ S = nShared; sharedI = pick(c,['moe_intermediate_size']) ?? expertI; }
 
-    const step = pick(c,['decoder_sparse_step','moe_layer_freq']) ?? 1;
+    // two different conventions decide which layers are MoE, and they are off by one:
+    //   Qwen2MoE   (layer_idx + 1) % decoder_sparse_step == 0
+    //   DeepSeek    layer_idx      % moe_layer_freq      == 0   (may also be a per-layer 0/1 list)
+    const sparseStep = pick(c,['decoder_sparse_step']);
+    const moeFreq = pick(c,['moe_layer_freq']);
+    const isMoeLayer = i =>
+      sparseStep !== undefined ? (i+1) % sparseStep === 0
+      : Array.isArray(moeFreq) ? moeFreq[i] === 1
+      : moeFreq !== undefined  ? i % moeFreq === 0
+      : true;
     const firstDense = pick(c,['first_k_dense_replace']) ?? 0;
     const mlpOnly = new Set(Array.isArray(c.mlp_only_layers)? c.mlp_only_layers : []);
     let moeLayers = 0, denseLayers = 0;
     for(let i=0;i<L;i++){
-      const asMoe = isMoe && i>=firstDense && !mlpOnly.has(i) && ((i+1)%step===0);
+      const asMoe = isMoe && i>=firstDense && !mlpOnly.has(i) && isMoeLayer(i);
       if(asMoe) moeLayers++; else denseLayers++;
     }
 
@@ -495,7 +504,8 @@
       warn.push('检测到 MLA（kv_lora_rank），注意力按标准 GQA 近似，略有偏差');
     if(denseLayers>0 && I===undefined)
       warn.push('有 dense 层但缺 intermediate_size，dense FFN 记为 0');
-    const mtpN = pick(c,['mtp_num_hidden_layers']) || 0;
+    // DeepSeek-V3 / GLM-4.5 spell this num_nextn_predict_layers; without it MTP is silently skipped
+    const mtpN = pick(c,['mtp_num_hidden_layers','num_nextn_predict_layers']) || 0;
 
     // attention: split full vs linear (GatedDeltaNet) when layer_types is given
     const attnGate = c.attn_output_gate === true;      // Qwen3-Next output gate: +1 proj
