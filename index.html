@@ -464,8 +464,9 @@
 
     const kv = pick(c,['num_key_value_heads','num_kv_heads']) ?? H;
     const headDim = pick(c,['head_dim','head_size']) ?? Math.round(d/H);
+    // HF's PretrainedConfig defaults tie_word_embeddings to true, so absent means tied
     let tie = pick(c,['tie_word_embeddings','tie_weights']);
-    if(tie===undefined){ tie = false; warn.push('tie_word_embeddings 缺省，按 false（不共享）'); }
+    if(tie===undefined){ tie = true; warn.push('tie_word_embeddings 缺省，按 HF 默认 true（共享）'); }
 
     const N = pick(c,['num_experts','num_local_experts','n_routed_experts','moe_num_experts']);
     const isMoe = N!==undefined && N>0;
@@ -508,7 +509,8 @@
     // qkv bias is often absent from the config: Qwen2 hardcodes it on, and o_proj never carries it.
     // qk_norm is likewise implicit for the whole Qwen3 family.
     const arch = String((cRaw.architectures || c.architectures || [])[0] || '');
-    const qkvBias = (pick(c,['attention_bias','add_qkv_bias','use_bias']) ?? /^Qwen2(Moe)?ForCausalLM$/.test(arch)) === true;
+    // the whole Qwen2 line (incl. Qwen2-VL / Qwen2.5-VL) hardcodes qkv bias; Qwen3 dropped it
+    const qkvBias = (pick(c,['attention_bias','add_qkv_bias','use_bias']) ?? /^Qwen2/.test(arch)) === true;
     const qkNorm = (pick(c,['use_qk_norm','qk_layernorm','use_qk_layernorm']) ?? /^Qwen3/.test(arch)) === true;
 
     // MLA (DeepSeek V2/V3): q and kv run through a low-rank latent instead of plain q/k/v.
@@ -521,14 +523,18 @@
     const vDim = pick(c,['v_head_dim']) ?? headDim;
     const qkHead = (nope + rope) || headDim;
 
-    // attention: split full vs linear (GatedDeltaNet) when layer_types is given
-    const attnGate = c.attn_output_gate === true;      // Qwen3-Next output gate: +1 proj
+    // attention: split full vs linear (GatedDeltaNet) when layer_types is given.
+    // Qwen3-Next fuses an output gate into q_proj, doubling it, and never says so in the config.
+    const attnGate = c.attn_output_gate === true || /^Qwen3Next/.test(arch);
+    // the norms that live inside the attention block belong to it, not to the per-layer norm row:
+    // Qwen3-Next only carries q/k norm on its full-attention layers, so counting them L times is wrong
     const mlaPer = isMLA
-      ? (qLora !== undefined ? d*qLora + qLora*(H*qkHead) : d*(H*qkHead))
-        + d*(kvLora + rope) + kvLora*(H*(nope + vDim)) + (H*vDim)*d
+      ? (qLora !== undefined ? d*qLora + qLora*(H*qkHead) + qLora : d*(H*qkHead))
+        + d*(kvLora + rope) + kvLora + kvLora*(H*(nope + vDim)) + (H*vDim)*d
       : 0;
     const gqaPer = 2*(H*headDim)*d + 2*(kv*headDim)*d + (attnGate ? (H*headDim)*d : 0)
-                 + (qkvBias ? (H + 2*kv)*headDim : 0);
+                 + (qkvBias ? (H + 2*kv)*headDim : 0)
+                 + (qkNorm ? 2*headDim : 0);
     const fullPer = isMLA ? mlaPer : gqaPer;
     const fullExpr = isMLA
       ? (qLora !== undefined ? 'q_a '+d+'·'+qLora+' + q_b '+qLora+'·('+H+'·'+qkHead+')'
@@ -538,20 +544,28 @@
       : 'q/o 2·('+H+'·'+headDim+')·'+d+' + k/v 2·('+kv+'·'+headDim+')·'+d
         + (attnGate ? ' + gate '+H+'·'+headDim+'·'+d : '')
         + (qkvBias ? ' + qkv bias ('+H+'+2·'+kv+')·'+headDim : '');
-    const layerTypes = Array.isArray(c.layer_types) ? c.layer_types : null;
-    let attn, attnLabel, attnF;
+    // how many layers use full attention. layer_types spells it out; Qwen3-Next instead gives
+    // full_attention_interval and makes every other layer a GatedDeltaNet block.
+    const fullInterval = pick(c,['full_attention_interval']);
+    const layerTypes = Array.isArray(c.layer_types) ? c.layer_types
+      : fullInterval ? Array.from({length:L}, (_,i) => (i+1)%fullInterval===0 ? 'full_attention' : 'linear_attention')
+      : null;
+    // GatedDeltaNet block, exact: in_proj_qkvz packs q,k (2·qk) and v,z (2·vv); in_proj_ba is
+    // 2 scalars per value head; conv1d runs over 2·qk+vv; A_log and dt_bias are per value head.
+    const Kh=pick(c,['linear_num_key_heads'])||0, Kd=pick(c,['linear_key_head_dim'])||0;
+    const Vh=pick(c,['linear_num_value_heads'])||0, Vd=pick(c,['linear_value_head_dim'])||0;
+    const ck=pick(c,['linear_conv_kernel_dim'])||0;
+    const qk=Kh*Kd, vv=Vh*Vd;
+    const linPer = d*(2*qk + 2*vv) + d*(2*Vh) + (2*qk+vv)*ck + 2*Vh + Vd + vv*d;
+    let attn, attnLabel, attnF, nFull = L, nLin = 0;
     if(layerTypes){
-      const nFull = layerTypes.filter(x=>/full/.test(x)).length;
-      const nLin  = layerTypes.filter(x=>/linear/.test(x)).length;
-      const Kh=pick(c,['linear_num_key_heads'])||0, Kd=pick(c,['linear_key_head_dim'])||0;
-      const Vh=pick(c,['linear_num_value_heads'])||0, Vd=pick(c,['linear_value_head_dim'])||0;
-      const ck=pick(c,['linear_conv_kernel_dim'])||0;
-      const qk=Kh*Kd, vv=Vh*Vd;               // GatedDeltaNet: in_proj_qkvz = q,k (2·d·qk) + v,z (2·d·vv), out_proj (d·vv), conv over (2·qk+vv)
-      const linPer = d*qk*2 + d*vv*3 + (2*qk+vv)*ck;
+      // only linear attention has a different weight shape. sliding_attention / chunked_attention
+      // differ solely in the mask, so they must be counted as full or their params vanish.
+      nLin  = layerTypes.filter(x=>/linear/.test(x)).length;
+      nFull = L - nLin;
       attn = fullPer*nFull + linPer*nLin;
       attnLabel = 'Attention（'+nFull+' full + '+nLin+' linear）';
-      attnF = nFull+'×full('+fmt(fullPer)+'/层) + '+nLin+'×linear(≈'+fmt(linPer)+'/层，GatedDeltaNet)';
-      if(nLin>0) warn.push('linear_attention 层按 GatedDeltaNet 近似计（'+nLin+' 层），略有偏差');
+      attnF = nFull+'×full('+fmt(fullPer)+'/层) + '+nLin+'×linear('+fmt(linPer)+'/层，GatedDeltaNet)';
     } else {
       attn = fullPer * L;
       attnLabel = 'Attention（×'+L+' 层）';
@@ -560,7 +574,10 @@
     const denseFFN = mult * d * (I||0) * denseLayers;
     const expertsTot = isMoe ? mult*d*expertI*N*moeLayers : 0;
     const expertsAct = isMoe ? mult*d*expertI*Math.min(topk,N)*moeLayers : 0;
-    const shared = (isMoe && S>0 && sharedI) ? mult*d*sharedI*S*moeLayers : 0;
+    // the Qwen lineage (shared_expert_intermediate_size) puts a [1, d] sigmoid gate on the shared
+    // expert; the DeepSeek lineage (n_shared_experts) always runs it and has no gate
+    const sharedGate = (nShared === undefined && sharedI !== undefined) ? d : 0;
+    const shared = (isMoe && S>0 && sharedI) ? (mult*d*sharedI*S + sharedGate)*moeLayers : 0;
     // the aux-loss-free sigmoid gate carries one e_score_correction_bias scalar per expert.
     // GLM-4.5 omits scoring_func but is sigmoid; DeepSeek-V2 says softmax and has no bias.
     const gateBias = (pick(c,['scoring_func']) ?? (pick(c,['n_group'])!==undefined ? 'sigmoid' : 'softmax')) === 'sigmoid';
@@ -568,12 +585,13 @@
     const router = isMoe ? routerPer*moeLayers : 0;
     const emb = V*d*(tie?1:2);
 
-    // RMSNorm weights: 2 per layer (input + post_attention) plus the final model.norm,
-    // and the extra norms that MLA and QK-Norm introduce inside the attention block
-    const normPerLayer = 2*d + (isMLA ? (qLora !== undefined ? qLora : 0) + kvLora : 0) + (qkNorm ? 2*headDim : 0);
+    // RMSNorm weights: input + post_attention per layer, plus the final model.norm.
+    // norms living inside the attention block (MLA's q_a/kv_a, QK-Norm, GatedDeltaNet's) are
+    // counted with their own block, since they do not appear on every layer.
+    // Gemma 2/3 add a norm on each side of the FFN, on top of the usual pair
+    const normPerLayer = 2*d + (/^Gemma[23]/.test(arch) ? 2*d : 0);
     const norms = normPerLayer*L + d;
-    const normF = L+' 层 × '+normPerLayer+'（input + post_attn'
-      + (isMLA ? ' + q_a/kv_a' : '') + (qkNorm ? ' + q/k norm' : '') + '） + final '+d;
+    const normF = L+' 层 × '+normPerLayer+'（input + post_attn'+(/^Gemma[23]/.test(arch)?' + pre/post ffn':'')+'） + final '+d;
 
     // vision tower — a ViT: counted into TOTAL (not on the text-token active path)
     const vc = cRaw.vision_config || c.vision_config;
@@ -581,26 +599,45 @@
     if(vc){
       const vh=pick(vc,['hidden_size']), vL=pick(vc,['depth','num_hidden_layers']), vI=pick(vc,['intermediate_size']);
       if(vh && vL && vI){
-        const vpatch=pick(vc,['patch_size'])||14, vt=pick(vc,['temporal_patch_size'])||1;
-        const vin=pick(vc,['in_channels','num_channels'])||3, vmerge=pick(vc,['spatial_merge_size'])||1;
+        const vpatch=pick(vc,['patch_size','spatial_patch_size'])||14, vt=pick(vc,['temporal_patch_size'])||1;
+        const vin=pick(vc,['in_channels','in_chans','num_channels'])||3, vmerge=pick(vc,['spatial_merge_size'])||1;
         const vout=pick(vc,['out_hidden_size'])||vh, vpos=pick(vc,['num_position_embeddings'])||0;
-        const vgated=/glu/.test(String(pick(vc,['hidden_act'])||'gelu').toLowerCase()) ? 3 : 2;
+        const vact=String(pick(vc,['hidden_act'])||'gelu').toLowerCase();
+        const vgated=/glu|silu|swish/.test(vact) ? 3 : 2;
         const vctx=vh*vmerge*vmerge;
-        const vblocks=(4*vh*vh + vgated*vh*vI)*vL, vpe=vin*vt*vpatch*vpatch*vh, vpos2=vpos*vh, vmerger=vctx*vctx+vctx*vout;
-        vision = vblocks + vpe + vpos2 + vmerger;
-        visionF = 'ViT '+vL+'层×(4·'+vh+'² + '+vgated+'·'+vh+'·'+vI+')='+fmt(vblocks)+' + patch/pos '+fmt(vpe+vpos2)+' + merger '+fmt(vmerger);
+        // Qwen3-VL's ViT uses LayerNorm (weight + bias) and biases its patch embed; Qwen2.5-VL
+        // uses RMSNorm (weight only) and has no patch-embed bias.
+        const vmt=String(pick(vc,['model_type'])||'');
+        const deep=Array.isArray(vc.deepstack_visual_indexes) ? vc.deepstack_visual_indexes.length : 0;
+        const vLN=/qwen3/.test(vmt) || deep>0 || vpos>0;
+        const nw=vLN?2:1;                       // norm weights per norm (LayerNorm also has bias)
+        // block: qkv+proj (4·vh² plus their bias) + gated or plain MLP with bias + 2 norms
+        const vblock=4*vh*vh + 4*vh + vgated*vh*vI + (vgated-1)*vI + vh + 2*vh*nw;
+        const vblocks=vblock*vL;
+        const vpe=vin*vt*vpatch*vpatch*vh + (vLN?vh:0);
+        const vpos2=vpos*vh;
+        const mergerU=(nd)=> nd*nw + vctx*vctx + vctx + vout*vctx + vout;
+        const vmerger=mergerU(vh);              // main merger normalises at vh
+        const vdeep=deep*mergerU(vctx);         // deepstack mergers normalise at vctx
+        vision = vblocks + vpe + vpos2 + vmerger + vdeep;
+        visionF = 'ViT '+vL+'层×'+fmt(vblock)+' + patch/pos '+fmt(vpe+vpos2)+' + merger '+fmt(vmerger)
+                + (deep ? ' + deepstack ×'+deep+' '+fmt(vdeep) : '');
       } else { warn.push('vision_config 字段不足，视觉塔未计入'); }
     }
 
-    // MTP layer(s) — one transformer block (full attn + FFN/MoE) + eh_proj (2d×d), counted into TOTAL
+    // MTP layer(s): a transformer block + a 2d×d projection + 3 norms, counted into TOTAL.
+    // Qwen3-Next ships one under mtp.* without ever declaring it in the config.
+    const mtpCount = mtpN || (/^Qwen3Next/.test(arch) ? 1 : 0);
     let mtp = 0, mtpF = '';
-    if(mtpN>0){
-      const ffnPer = isMoe ? (mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S : 0) + routerPer) : (mult*d*(I||0));
-      // the MTP block is weight-tied to the main embed/head in use, but DeepSeek-V3 and GLM-4.5
-      // both store physical copies of embed_tokens and shared_head.head, so the checkpoint pays for them
-      mtp = mtpN * (fullPer + ffnPer + 2*d*d + normPerLayer + 3*d + 2*V*d);
-      mtpF = mtpN+' × (full attn '+fmt(fullPer)+' + '+(isMoe?'MoE 层 ':'FFN ')+fmt(ffnPer)
-           + ' + eh_proj 2·'+d+'² + embed/head 副本 '+fmt(2*V*d)+' + norms)';
+    if(mtpCount>0){
+      const ffnPer = isMoe ? (mult*d*expertI*N + (S>0&&sharedI ? mult*d*sharedI*S + sharedGate : 0) + routerPer) : (mult*d*(I||0));
+      // DeepSeek-V3 and GLM-4.5 store physical copies of embed_tokens and shared_head.head in the
+      // MTP block, so the checkpoint pays for them even though they are tied in use.
+      // Qwen3-Next reuses the main ones and stores no copy.
+      const mtpEmb = mtpN>0 ? 2*V*d : 0;
+      mtp = mtpCount * (fullPer + ffnPer + 2*d*d + normPerLayer + 3*d + mtpEmb);
+      mtpF = mtpCount+' × (full attn '+fmt(fullPer)+' + '+(isMoe?'MoE 层 ':'FFN ')+fmt(ffnPer)
+           + ' + proj 2·'+d+'²' + (mtpEmb?' + embed/head 副本 '+fmt(mtpEmb):'') + ' + norms)';
     }
     if(vision || mtp) warn.push('视觉塔 / MTP 已计入总参数；激活参数按纯文本前向计，故其激活列记 0');
 
@@ -610,7 +647,7 @@
 
     return {
       isMoe, warn, hasExtra: !!(vision || mtp),
-      params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie,vision,mtp,mtpN,isMLA,qkvBias,qkNorm},
+      params:{d,L,H,kv,headDim,V,I,expertI,N,topk,S,sharedI,moeLayers,denseLayers,tie,vision,mtp,mtpN:mtpCount,isMLA,qkvBias,qkNorm,nFull,nLin},
       rows:[
         {label:'Embedding'+(tie?'（tied ×1）':'（×2）'), f:(tie ? (V+' × '+d+'（vocab × d，tied 共享）') : ('2 × '+V+' × '+d+'（vocab × d，embed + lm_head）')), total:emb, active:emb},
         {label:attnLabel, f:attnF, total:attn, active:attn},
@@ -620,9 +657,9 @@
         isMoe ? {label:'Router', f:moeLayers+' 层 × ('+d+'×'+N+(gateBias?' + '+N+' 校正 bias':'')+'）', total:router, active:router} : null,
         {label:'Norm', f:normF, total:norms, active:norms},
         vision ? {label:'Vision 塔（视觉编码器）', f:visionF, total:vision, active:0, extra:true} : null,
-        mtp ? {label:'MTP 预测层 ×'+mtpN, f:mtpF, total:mtp, active:0, extra:true} : null,
+        mtp ? {label:'MTP 预测层 ×'+mtpCount, f:mtpF, total:mtp, active:0, extra:true} : null,
       ].filter(Boolean),
-      total, active, llmTotal
+      total, active, llmTotal, activeNoEmb: active - emb
     };
   }
 
@@ -650,7 +687,11 @@
     $('bigTotal').textContent = fmt(shownTotal);
     $('bigAct').textContent   = r.isMoe ? fmt(r.active) : fmt(shownTotal);
     $('capTotal').textContent = llmOnly ? '仅语言模型（不含视觉塔 / MTP），对外标尺寸常用这个。' : '整份 checkpoint 全部权重，决定占多少显存。';
-    $('capAct').textContent   = r.isMoe ? ('每 token 实际走过（top-'+p.topk+'），决定算多快。') : 'dense 模型：激活 = 总参数。';
+    // vendors disagree on whether activated params include the embedding: DeepSeek and Qwen
+    // count it, GLM does not, so show both rather than picking a side
+    $('capAct').textContent   = r.isMoe
+      ? ('每 token 实际走过（top-'+p.topk+'），决定算多快。不含 embedding 为 '+fmt(r.activeNoEmb)+'，各家口径不一，对外标 A×B 时两种都有人用。')
+      : 'dense 模型：激活 = 总参数。';
 
     let t = '<tr><th>组成</th><th style="text-align:right">总参数</th><th style="text-align:right">激活</th></tr>';
     rows.forEach(row => {
